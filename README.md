@@ -1,5 +1,5 @@
 # Vahini: The Distributed Benchmarking & Hosting Platform 
-# [Live Demo](https://trading-system-benchmarking-hosting.vercel.app/) <- click
+# [Live Demo](http://vahini.duckdns.org/) <- click
 
 Vahini is a benchmarking and hosting platform for evaluating contestant-submitted trading engines. It accepts source-code ZIP submissions, builds and runs them in isolated Docker containers, validates exchange correctness, drives high-concurrency order traffic with a Go load generator, persists benchmark results in PostgreSQL, and streams rankings to a React leaderboard.
 
