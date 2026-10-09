@@ -5,7 +5,6 @@ import LeaderboardTable from "./components/LeaderboardTable";
 import OverviewPanel from "./components/OverviewPanel";
 import ResultsPanel from "./components/ResultsPanel";
 import SubmitPanel from "./components/SubmitPanel";
-import { API_BASE, WS_URL } from "./lib/config";
 
 const STORAGE_KEY = "iicpc_recent_submissions";
 
@@ -19,7 +18,7 @@ function readRecentSubmissions() {
 
 function App() {
   const [activeView, setActiveView] = useState("overview");
-  const [connectionState, setConnectionState] = useState("offline");
+  const [connectionState] = useState("online"); // Hardcoded to online for static demo
   const [currentSubmission, setCurrentSubmission] = useState(null);
   const [error, setError] = useState("");
   const [file, setFile] = useState(null);
@@ -27,7 +26,21 @@ function App() {
     contestantName: "",
     language: "Python",
   });
-  const [leaderboard, setLeaderboard] = useState([]);
+  const [leaderboard, setLeaderboard] = useState([
+    // Initial mock leaderboard data
+    {
+      submission_id: "demo1234",
+      contestant_name: "Demo User",
+      language: "Python",
+      score: 8.5,
+      correctness_score: 40,
+      tps: 120.5,
+      p50_latency_ms: 12,
+      p90_latency_ms: 18,
+      p99_latency_ms: 25,
+      failures: 2,
+    }
+  ]);
   const [recentSubmissions, setRecentSubmissions] = useState(readRecentSubmissions);
   const [status, setStatus] = useState(null);
   const [uploading, setUploading] = useState(false);
@@ -66,118 +79,81 @@ function App() {
     setUploading(true);
     setError("");
 
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("contestant_name", form.contestantName || "Anonymous");
-    formData.append("language", form.language);
-
-    try {
-      const response = await fetch(`${API_BASE}/submit`, {
-        method: "POST",
-        body: formData,
-      });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.detail || "Upload failed");
-      }
-
+    // Mock upload network request
+    setTimeout(() => {
+      const newId = Math.random().toString(36).substring(2, 10);
       const submission = {
-        submission_id: data.submission_id,
-        contestant_name: data.contestant_name || form.contestantName || "Anonymous",
-        language: data.language || form.language,
+        submission_id: newId,
+        contestant_name: form.contestantName || "Anonymous",
+        language: form.language,
       };
 
       setCurrentSubmission(submission);
-      setStatus({ ...submission, status: data.status });
+      setStatus({ ...submission, status: "waiting" });
       saveRecentSubmission(submission);
       setActiveView("results");
       setFile(null);
-    } catch (uploadError) {
-      setError(uploadError.message);
-    } finally {
       setUploading(false);
-    }
+    }, 1500);
   }
 
   function selectSubmission(submission) {
     setCurrentSubmission(submission);
-    setStatus({ ...submission, status: "waiting" });
+    // If it's a known demo submission or from cache, mock it to completed
+    setStatus({ ...submission, status: "completed", score: 7.5, correctness_score: 30, tps: 0.0, failures: 798, correctness_checks: { empty_book: true, market_order_execution: true, cancellation: true } });
     setActiveView("results");
   }
 
-  async function fetchLeaderboard() {
-    const response = await fetch(`${API_BASE}/leaderboard`);
-    if (!response.ok) return;
-    const data = await response.json();
-    setLeaderboard(data);
-  }
-
+  // Mock progression of status for new submissions
   useEffect(() => {
     if (!currentSubmissionId) return undefined;
 
-    let cancelled = false;
-
-    async function fetchStatus() {
-      try {
-        const response = await fetch(`${API_BASE}/status/${currentSubmissionId}`);
-        if (!response.ok) return;
-        const data = await response.json();
-        if (!cancelled) {
-          setStatus(data);
-          if (["completed", "failed", "failed_handoff", "stopped"].includes(data.status)) {
-            fetchLeaderboard();
+    let timer;
+    if (status?.status === "waiting") {
+      timer = setTimeout(() => {
+        setStatus(current => ({ ...current, status: "processing" }));
+      }, 2000);
+    } else if (status?.status === "processing") {
+      timer = setTimeout(() => {
+        const mockResult = {
+          status: "completed",
+          score: (Math.random() * 5 + 5).toFixed(2), // Random score between 5 and 10
+          correctness_score: 40,
+          tps: (Math.random() * 200).toFixed(2),
+          success: 1.0,
+          p50_latency_ms: (Math.random() * 10 + 5).toFixed(2),
+          p90_latency_ms: (Math.random() * 15 + 10).toFixed(2),
+          p99_latency_ms: (Math.random() * 20 + 15).toFixed(2),
+          failures: Math.floor(Math.random() * 10),
+          correctness_checks: {
+            empty_book: true,
+            duplicate_orders: true,
+            invalid_side: true,
+            market_order_execution: true,
+            price_time_priority: true,
+            multiple_fills: true,
+            partial_fills: false,
+            cancellation: true,
+            remaining_quantity: true,
           }
-        }
-      } catch {
-        if (!cancelled) {
-          setStatus((current) => ({
-            ...current,
-            status: current?.status || "waiting",
-          }));
-        }
-      }
+        };
+        setStatus(current => ({ ...current, ...mockResult }));
+        
+        setLeaderboard(prev => {
+          const entry = {
+            submission_id: currentSubmissionId,
+            contestant_name: status.contestant_name || "Anonymous",
+            language: status.language,
+            ...mockResult
+          };
+          return [...prev.filter(p => p.submission_id !== currentSubmissionId), entry];
+        });
+
+      }, 3500);
     }
 
-    fetchStatus();
-    const timer = window.setInterval(fetchStatus, 1500);
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [currentSubmissionId]);
-
-  useEffect(() => {
-    fetchLeaderboard();
-  }, []);
-
-  useEffect(() => {
-    let ws;
-    let reconnectTimer;
-
-    function connect() {
-      ws = new WebSocket(WS_URL);
-      ws.onopen = () => setConnectionState("online");
-      ws.onmessage = (event) => setLeaderboard(JSON.parse(event.data));
-      ws.onclose = () => {
-        setConnectionState("offline");
-        reconnectTimer = window.setTimeout(connect, 2500);
-      };
-      ws.onerror = () => {
-        setConnectionState("offline");
-        ws.close();
-      };
-    }
-
-    connect();
-
-    return () => {
-      window.clearTimeout(reconnectTimer);
-      ws?.close();
-    };
-  }, []);
+    return () => clearTimeout(timer);
+  }, [currentSubmissionId, status?.status, status?.contestant_name, status?.language]);
 
   return (
     <AppShell
