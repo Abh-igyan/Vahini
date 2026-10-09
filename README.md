@@ -1,5 +1,5 @@
 # Vahini: The Distributed Benchmarking & Hosting Platform 
-# [Live Demo](http://vahini.duckdns.org/) <- click
+# [Live Demo](http://vahini.duckdns.org:5173/) <- click
 
 Vahini is a benchmarking and hosting platform for evaluating contestant-submitted trading engines. It accepts source-code ZIP submissions, builds and runs them in isolated Docker containers, validates exchange correctness, drives high-concurrency order traffic with a Go load generator, persists benchmark results in PostgreSQL, and streams rankings to a React leaderboard.
 
@@ -27,25 +27,25 @@ flowchart TB
     classDef aws fill:#ff9900,stroke:#232f3e,stroke-width:2px,color:#000
 
     subgraph Internet ["Public Internet"]
-        UserBrowser["🌐 User Browser\n(React Frontend)"]:::frontend
+        UserBrowser["ðŸŒ User Browser\n(React Frontend)"]:::frontend
     end
 
     subgraph AWS ["AWS Virtual Private Cloud (VPC)"]
         subgraph OrchestratorNode ["Central Orchestrator (EC2: 106.222.224.67)"]
-            FastAPI["⚡ FastAPI Backend\n(Port 8000)"]:::python
-            Postgres[("🐘 PostgreSQL DB\n(Leaderboard/Scores)")]:::db
+            FastAPI["âš¡ FastAPI Backend\n(Port 8000)"]:::python
+            Postgres[("ðŸ˜ PostgreSQL DB\n(Leaderboard/Scores)")]:::db
             
             subgraph DockerEnv ["Docker Runtime"]
-                gVisor["🛡️ gVisor Sandbox (runsc)\n(Port 8080)"]:::docker
+                gVisor["ðŸ›¡ï¸ gVisor Sandbox (runsc)\n(Port 8080)"]:::docker
                 ContestantCode["Contestant Trading Engine\n(C++, Go, Rust, Java, etc.)"]
                 gVisor --- ContestantCode
             end
         end
 
         subgraph WorkerFleet ["Load Generator Fleet (EC2 Private Subnet)"]
-            GoWorker1["🐹 Go Worker Node 1\n(172.31.8.102:8001)"]:::go
-            GoWorker2["🐹 Go Worker Node 2\n(172.31.6.96:8001)"]:::go
-            GoWorker3["🐹 Go Worker Node 3\n(172.31.13.78:8001)"]:::go
+            GoWorker1["ðŸ¹ Go Worker Node 1\n(172.31.8.102:8001)"]:::go
+            GoWorker2["ðŸ¹ Go Worker Node 2\n(172.31.6.96:8001)"]:::go
+            GoWorker3["ðŸ¹ Go Worker Node 3\n(172.31.13.78:8001)"]:::go
         end
     end
 
@@ -129,10 +129,10 @@ Infrastructure:    AWS EC2
 
 ```text
 .
-├── frontend/              # React/Vite Vahini dashboard
-├── load_generator/        # Go load generation service
-├── submission_engine/     # FastAPI submission/sandbox/orchestration service
-└── docs/images/           # README screenshots
+â”œâ”€â”€ frontend/              # React/Vite Vahini dashboard
+â”œâ”€â”€ load_generator/        # Go load generation service
+â”œâ”€â”€ submission_engine/     # FastAPI submission/sandbox/orchestration service
+â””â”€â”€ docs/images/           # README screenshots
 ```
 
 ## Local Ports
@@ -372,6 +372,17 @@ These are useful for checking latency degradation, incorrect behavior, invalid-o
 - Uploaded artifacts are stored on the local filesystem (no object storage yet).
 - No Redpanda/Kafka or ClickHouse yet; these remain scale-up options.
 
+## Architectural Trade-off: EC2 vs. Serverless
+Vahini deliberately uses an **EC2-based worker architecture** instead of a Serverless (AWS Lambda) approach for load generation. While Serverless offers $0 idle costs and instant infinite scaling, it was rejected for this specific platform due to the **High-Frequency Trading (HFT) requirements**:
+1. **Network Locality:** By placing the Orchestrator and Go Workers in the same AWS Placement Group/Subnet, we achieve sub-millisecond network jitter, which is critical for accurate p99 latency benchmarking. Serverless introduces multi-tenant network jitter (1-3ms).
+2. **Persistent Connections:** Future plans involve testing engines using WebSockets and the FIX protocol. Lambda strictly limits execution time and restricts persistent stateful socket connections, whereas dedicated EC2 workers can maintain heavily optimized, long-lived TCP connection pools (as seen in the Go client configuration).
+
+**How to optimize this EC2 architecture for $0 cost:**
+To maintain this low-latency architecture while minimizing cloud costs:
+1. **Consolidated Free Tier:** Run the Orchestrator, gVisor sandbox, and Go Load Generators all on the *same* `t3.micro` EC2 instance (eligible for the AWS Free Tier). This results in $0 cost and 0 network hops (localhost/IPC) for ultra-low latency.
+2. **Scale-to-Zero EC2 Scripting:** Implement a cron job on the EC2 instance that checks for idle time (e.g., no submissions in 30 minutes) and issues a `sudo shutdown -h now`. 
+3. **Decoupled Free Services:** Keep the frontend hosted on Vercel/Cloudflare Pages ($0) and the PostgreSQL database on Neon.tech ($0 Serverless Postgres).
+
 ## Future Work
 
 - Add market orders, cancels, and mixed traffic profiles.
@@ -391,3 +402,17 @@ These are useful for checking latency degradation, incorrect behavior, invalid-o
 - **FastAPI**: For the blazing-fast, async-native Python web orchestration.
 - **Go**: For the lightweight Goroutines powering the massive concurrency of the load generator fleet.
 - **Mermaid.js**: For the declarative, code-based system architecture diagrams.
+
+## Security vs Performance: The gVisor Tradeoff
+Vahini allows toggling the use of [gVisor](https://gvisor.dev/) (`runsc`) for sandboxing untrusted code. However, in an HFT benchmarking context, this introduces a substantial performance penalty.
+
+gVisor works by implementing a **userspace kernel** that intercepts and translates every system call. While this provides excellent security isolation (preventing container breakouts), it creates massive overhead for network-heavy, socket-bound applications like a matching engine.
+
+**Benchmarking Results (Standard Docker vs gVisor):**
+In a 10-second high-concurrency attack on an EC2 cluster using the exact same load profile, we observed:
+* **Standard Docker (`runc`)**: ~1,465 TPS | ~625ms p99 latency
+* **gVisor (`runsc`)**: ~896 TPS | ~1,010ms p99 latency
+
+*Impact:* gVisor causes a **~39% drop in throughput** and adds **~385ms of latency** at the tail due to context switching and userspace networking overhead. 
+
+For strict HFT latency measurement, standard Docker with tightened native security (Seccomp profiles blocking unused syscalls, `--cap-drop=ALL`, user namespaces) or hardware-isolated Firecracker microVMs are recommended over gVisor to prevent the sandbox itself from polluting the latency metrics.
