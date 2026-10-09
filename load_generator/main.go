@@ -13,12 +13,15 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/aws/aws-lambda-go/lambda"
 )
 
 // BenchmarkRequest represents the payload Python sends to Go
@@ -57,10 +60,25 @@ var httpClient = &http.Client{
 	Timeout: 5 * time.Second,
 }
 
+// Lambda handler function
+func lambdaHandler(ctx context.Context, req BenchmarkRequest) (BenchmarkResult, error) {
+	if req.Endpoint == "" || req.Concurrency <= 0 || req.DurationSec <= 0 {
+		return BenchmarkResult{}, errors.New("invalid request parameters")
+	}
+	result := startStressTest(req.SubmissionID, req.Endpoint, req.Concurrency, time.Duration(req.DurationSec)*time.Second)
+	return result, nil
+}
+
 func main() {
-	http.HandleFunc("/benchmark", handleBenchmark)
-	log.Println("Go Load Generator listening on :8001...")
-	log.Fatal(http.ListenAndServe(":8001", nil))
+	if os.Getenv("AWS_LAMBDA_RUNTIME_API") != "" {
+		// Run in AWS Lambda mode
+		lambda.Start(lambdaHandler)
+	} else {
+		// Run in Local HTTP server mode
+		http.HandleFunc("/benchmark", handleBenchmark)
+		log.Println("Go Load Generator listening on :8001 (Local Mode)...")
+		log.Fatal(http.ListenAndServe(":8001", nil))
+	}
 }
 
 func incrementError(m *sync.Map, key string) {

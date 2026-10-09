@@ -26,10 +26,14 @@ class SandboxManager:
         await asyncio.to_thread(self.stop_container, submission_id)
 
         def run_container():
+            # Allow toggling gVisor off for latency benchmarking
+            use_gvisor = os.getenv("USE_GVISOR", "true").lower() == "true"
+            runtime = "runsc" if use_gvisor else None
+            
             c=self.client.containers.run(
                 image=image_tag,
                 detach=True,
-                runtime="runsc",
+                runtime=runtime,
                 name=f"sandbox-{submission_id[:8]}-{purpose}",
                 cpu_period=100000,
                 cpu_quota=200000,

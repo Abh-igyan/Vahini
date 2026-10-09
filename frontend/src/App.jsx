@@ -5,7 +5,7 @@ import LeaderboardTable from "./components/LeaderboardTable";
 import OverviewPanel from "./components/OverviewPanel";
 import ResultsPanel from "./components/ResultsPanel";
 import SubmitPanel from "./components/SubmitPanel";
-import { API_BASE, WS_URL } from "./lib/config";
+import { API_BASE } from "./lib/config";
 
 const STORAGE_KEY = "iicpc_recent_submissions";
 
@@ -108,10 +108,14 @@ function App() {
   }
 
   async function fetchLeaderboard() {
-    const response = await fetch(`${API_BASE}/leaderboard`);
-    if (!response.ok) return;
-    const data = await response.json();
-    setLeaderboard(data);
+    try {
+      const response = await fetch(`${API_BASE}/leaderboard`);
+      if (!response.ok) return;
+      const data = await response.json();
+      setLeaderboard(data);
+    } catch (err) {
+      console.error("Fetch leaderboard failed:", err);
+    }
   }
 
   useEffect(() => {
@@ -151,32 +155,9 @@ function App() {
 
   useEffect(() => {
     fetchLeaderboard();
-  }, []);
-
-  useEffect(() => {
-    let ws;
-    let reconnectTimer;
-
-    function connect() {
-      ws = new WebSocket(WS_URL);
-      ws.onopen = () => setConnectionState("online");
-      ws.onmessage = (event) => setLeaderboard(JSON.parse(event.data));
-      ws.onclose = () => {
-        setConnectionState("offline");
-        reconnectTimer = window.setTimeout(connect, 2500);
-      };
-      ws.onerror = () => {
-        setConnectionState("offline");
-        ws.close();
-      };
-    }
-
-    connect();
-
-    return () => {
-      window.clearTimeout(reconnectTimer);
-      ws?.close();
-    };
+    const timer = window.setInterval(fetchLeaderboard, 5000);
+    setConnectionState("online"); // Polling works over HTTP, no connection state needed
+    return () => window.clearInterval(timer);
   }, []);
 
   return (

@@ -19,7 +19,7 @@ The platform continues to persist submission state and benchmark results in Post
 ```mermaid
 flowchart TB
     %% Styling
-    classDef frontend fill:#61dafb,stroke:#000,stroke-width:2px,color:#000
+    classDef frontend fill:#000,stroke:#fff,stroke-width:2px,color:#fff
     classDef python fill:#ffd43b,stroke:#3776ab,stroke-width:2px,color:#000
     classDef db fill:#336791,stroke:#fff,stroke-width:2px,color:#fff
     classDef go fill:#00add8,stroke:#000,stroke-width:2px,color:#fff
@@ -27,43 +27,80 @@ flowchart TB
     classDef aws fill:#ff9900,stroke:#232f3e,stroke-width:2px,color:#000
 
     subgraph Internet ["Public Internet"]
-        UserBrowser["🌐 User Browser\n(React Frontend)"]:::frontend
+        UserBrowser["🌐 User Browser"]
+        VercelFrontend["▲ Vercel\n(React Frontend)"]:::frontend
+        UserBrowser <--> VercelFrontend
     end
 
     subgraph AWS ["AWS Virtual Private Cloud (VPC)"]
-        subgraph OrchestratorNode ["Central Orchestrator (EC2: 106.222.224.67)"]
+        subgraph OrchestratorNode ["EC2 Orchestrator (t3.micro)"]
             FastAPI["⚡ FastAPI Backend\n(Port 8000)"]:::python
-            Postgres[("🐘 PostgreSQL DB\n(Leaderboard/Scores)")]:::db
+            Postgres[("🐘 PostgreSQL DB\n(Docker Local)")]:::db
             
             subgraph DockerEnv ["Docker Runtime"]
-                gVisor["🛡️ gVisor Sandbox (runsc)\n(Port 8080)"]:::docker
-                ContestantCode["Contestant Trading Engine\n(C++, Go, Rust, Java, etc.)"]
+                gVisor["🛡️ gVisor Sandbox (runsc)"]:::docker
+                ContestantCode["Contestant Engine\n(Untrusted Code)"]
                 gVisor --- ContestantCode
             end
         end
 
-        subgraph WorkerFleet ["Load Generator Fleet (EC2 Private Subnet)"]
-            GoWorker1["🐹 Go Worker Node 1\n(172.31.8.102:8001)"]:::go
-            GoWorker2["🐹 Go Worker Node 2\n(172.31.6.96:8001)"]:::go
-            GoWorker3["🐹 Go Worker Node 3\n(172.31.13.78:8001)"]:::go
+        subgraph WorkerFleet ["AWS ECS Fargate (Dynamic Scale-to-Zero)"]
+            Fargate1["🐹 Go Worker Task 1"]:::go
+            Fargate2["🐹 Go Worker Task 2"]:::go
+            Fargate3["🐹 Go Worker Task N"]:::go
         end
     end
 
     %% Relationships
-    UserBrowser -- "1. Uploads ZIP (REST)" --> FastAPI
-    FastAPI -. "2. Real-time Leaderboard (WebSockets)" .-> UserBrowser
+    VercelFrontend -- "1. API / Submit (HTTP Polling)" --> FastAPI
     
-    FastAPI -- "3. Read/Write Scores" --> Postgres
-    FastAPI -- "4. Builds & Spawns" --> gVisor
+    FastAPI -- "2. Read/Write Scores" --> Postgres
+    FastAPI -- "3. Build & Spawn Sandbox" --> gVisor
     
-    FastAPI -- "5. Broadcasts Start Time\n(Scatter)" --> GoWorker1
-    FastAPI -- "5. Broadcasts Start Time\n(Scatter)" --> GoWorker2
-    FastAPI -- "5. Broadcasts Start Time\n(Scatter)" --> GoWorker3
+    FastAPI -- "4. Spin up Fargate (boto3)" --> WorkerFleet
+    FastAPI -- "5. Broadcast Start" --> Fargate1
+    FastAPI -- "5. Broadcast Start" --> Fargate2
+    FastAPI -- "5. Broadcast Start" --> Fargate3
 
-    GoWorker1 -- "6. High TPS Traffic" --> gVisor
-    GoWorker2 -- "6. High TPS Traffic" --> gVisor
-    GoWorker3 -- "6. High TPS Traffic" --> gVisor
+    Fargate1 -- "6. High TPS Traffic" --> gVisor
+    Fargate2 -- "6. High TPS Traffic" --> gVisor
+    Fargate3 -- "6. High TPS Traffic" --> gVisor
 ```
+
+## Dynamic Scale-to-Zero Flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Vercel as Frontend (Vercel)
+    participant EC2 as Orchestrator (EC2)
+    participant ECS as Fargate Workers
+    participant DB as Postgres
+
+    User->>Vercel: Upload ZIP
+    Vercel->>EC2: POST /submit
+    EC2->>DB: Insert Submission (Status: Building)
+    EC2->>EC2: Build Docker Image
+    EC2->>DB: Update Status (Status: Checking)
+    EC2->>EC2: Run Correctness Checks
+    EC2->>DB: Save Correctness Score
+    
+    rect rgb(200, 230, 255)
+        Note over EC2,ECS: Dynamic Load Generation Phase
+        EC2->>DB: Update Status (Status: Provisioning Load Generators)
+        EC2->>ECS: boto3.run_task(capacity=N)
+        ECS-->>EC2: Waiting for IP allocation (~45s)
+        EC2->>DB: Update Status (Status: Benchmarking)
+        EC2->>ECS: Start Load Generation
+        ECS->>EC2: Blast Traffic at Contestant Code
+        ECS-->>EC2: Return Benchmark Metrics (TPS, Latency)
+        EC2->>ECS: boto3.stop_task() (Scale to zero)
+    end
+    
+    EC2->>DB: Save Final Score
+    Vercel-->>User: Poll /status returns Completed
+```
+
 ## What It Does
 
 ```text
@@ -73,11 +110,12 @@ Upload ZIP + metadata
 -> Health check + deterministic correctness checks
 -> Stop correctness container
 -> Start fresh benchmark container
+-> Dynamically provision ECS Fargate tasks
 -> Go bot fleet sends concurrent order traffic
 -> Collect TPS, failures, status codes, p50/p90/p99 latency
+-> Teardown Fargate tasks
 -> Calculate composite score
 -> Persist results in PostgreSQL
--> Stream live leaderboard over WebSocket
 ```
 
 ## Implemented Features
@@ -93,7 +131,7 @@ Upload ZIP + metadata
   - fill quantity
   - remaining ask state
   - invalid order rejection
-- Go load generator for concurrent REST order traffic.
+- Dynamic ECS Fargate provisioning for load generators.
 - Metrics collection:
   - total requests
   - successes
@@ -104,25 +142,19 @@ Upload ZIP + metadata
   - p50/p90/p99 latency
   - HTTP status-code distribution
 - Composite scoring from correctness and performance metrics.
-- React/Vite dashboard branded as Vahini:
-  - Overview
-  - Submit
-  - My Results
-  - Leaderboard
-- Live leaderboard updates via FastAPI WebSockets.
-- Local recent-submission tracking in browser storage.
-- Configurable backend, frontend, CORS, DB, and load-generator URLs.
+- React/Vite dashboard deployed on Vercel.
+- HTTP Polling mechanism to bridge Vercel HTTPS to EC2 HTTP.
 
 ## Tech Stack
 
 ```text
-Frontend:          React, Vite
-Submission API:    FastAPI, asyncpg
-Load generator:    Go
+Frontend:          React, Vite (Hosted on Vercel)
+Submission API:    FastAPI, asyncpg (Hosted on EC2 t3.micro)
+Load generator:    Go (Hosted on ECS Fargate)
 Sandboxing:        Docker, gVisor/runsc
-Database:          Amazon RDS PostgreSQL
-Realtime:          WebSockets
-Infrastructure:    AWS EC2
+Database:          PostgreSQL (Dockerized on EC2)
+Realtime:          HTTP Polling via Vercel Rewrites
+Infrastructure:    AWS EC2, ECS Fargate
 ```
 
 ## Repository Layout
@@ -154,17 +186,14 @@ Submission engine environment variables:
 ```bash
 DATABASE_URL=postgresql://iicpc:iicpc_password@localhost:5432/iicpc
 LOAD_GENERATOR_URL=http://localhost:8001
-CORS_ORIGINS=http://localhost:5173
+CORS_ORIGINS=https://vahini1.vercel.app
 ```
 
 Frontend environment variables:
 
 ```bash
-VITE_API_BASE_URL=http://localhost:8000
-VITE_WS_URL=ws://localhost:8000/ws/leaderboard
+VITE_API_BASE_URL=/api
 ```
-
-If frontend variables are not set, the dashboard defaults to local FastAPI at `http://localhost:8000`.
 
 ## Running Locally
 
@@ -278,7 +307,6 @@ POST   /submit
 GET    /status/{submission_id}
 DELETE /status/{submission_id}
 GET    /leaderboard
-WS     /ws/leaderboard
 GET    /health
 ```
 
@@ -372,29 +400,25 @@ These are useful for checking latency degradation, incorrect behavior, invalid-o
 - Uploaded artifacts are stored on the local filesystem (no object storage yet).
 - No Redpanda/Kafka or ClickHouse yet; these remain scale-up options.
 
-## Architectural Trade-off: EC2 vs. Serverless
-Vahini deliberately uses an **EC2-based worker architecture** instead of a Serverless (AWS Lambda) approach for load generation. While Serverless offers $0 idle costs and instant infinite scaling, it was rejected for this specific platform due to the **High-Frequency Trading (HFT) requirements**:
-1. **Network Locality:** By placing the Orchestrator and Go Workers in the same AWS Placement Group/Subnet, we achieve sub-millisecond network jitter, which is critical for accurate p99 latency benchmarking. Serverless introduces multi-tenant network jitter (1-3ms).
-2. **Persistent Connections:** Future plans involve testing engines using WebSockets and the FIX protocol. Lambda strictly limits execution time and restricts persistent stateful socket connections, whereas dedicated EC2 workers can maintain heavily optimized, long-lived TCP connection pools (as seen in the Go client configuration).
+## Deployment Architecture
 
-**How to optimize this EC2 architecture for $0 cost:**
-To maintain this low-latency architecture while minimizing cloud costs:
-1. **Consolidated Free Tier:** Run the Orchestrator, gVisor sandbox, and Go Load Generators all on the *same* `t3.micro` EC2 instance (eligible for the AWS Free Tier). This results in $0 cost and 0 network hops (localhost/IPC) for ultra-low latency.
-2. **Scale-to-Zero EC2 Scripting:** Implement a cron job on the EC2 instance that checks for idle time (e.g., no submissions in 30 minutes) and issues a `sudo shutdown -h now`. 
-3. **Decoupled Free Services:** Keep the frontend hosted on Vercel/Cloudflare Pages ($0) and the PostgreSQL database on Neon.tech ($0 Serverless Postgres).
+The application is deployed on a **Scale-to-Zero** cloud architecture designed to minimize baseline costs while providing on-demand scaling during benchmark runs.
+
+1. **Frontend**: React/Vite dashboard hosted on **Vercel** ($0). A `vercel.json` rewrite intercepts all API traffic and proxies it to the backend Orchestrator, bypassing the browser's Mixed Content restrictions.
+2. **Orchestrator Backend**: FastAPI running on a **single AWS EC2 instance** (`t3.micro`, AWS Free Tier). This orchestrator securely runs contestant submissions locally using **Docker + gVisor** (`runsc`).
+3. **Database**: PostgreSQL 15 running in a Docker container directly on the EC2 Orchestrator. This achieves sub-millisecond local network latency and removes the need for managed RDS clusters.
+4. **Load Generators**: Go benchmark workers deployed to **AWS ECS Fargate**. The Orchestrator uses `boto3` to instantly spawn multiple Fargate tasks dynamically *only* when a benchmark triggers. Once the Fargate IP addresses resolve, the Orchestrator distributes the load generation tasks to them over the VPC. After the 10-second request storm finishes, the Fargate tasks are immediately destroyed. This effectively guarantees a **$0 idle cost** for the load generators while ensuring the Orchestrator EC2 instance never suffers from CPU starvation.
 
 ## Future Work
 
 - Add market orders, cancels, and mixed traffic profiles.
 - Add richer correctness cases (keeping some private) for price-time priority.
 - Add benchmark profiles configurable from the frontend.
-- Add AWS deployment scripts or Terraform.
 - Add Redpanda/Kafka for benchmark metric events.
 - Add ClickHouse for high-volume analytical queries.
 - Add S3-compatible storage for submitted artifacts.
 - Implement eBPF-based kernel latency profiling for granular performance insights.
 - Integrate Chaos Engineering (e.g., dropping network packets or terminating nodes during the benchmark storm).
-
 
 ## Acknowledgments
 
@@ -402,21 +426,3 @@ To maintain this low-latency architecture while minimizing cloud costs:
 - **FastAPI**: For the blazing-fast, async-native Python web orchestration.
 - **Go**: For the lightweight Goroutines powering the massive concurrency of the load generator fleet.
 - **Mermaid.js**: For the declarative, code-based system architecture diagrams.
-
-## Security vs Performance: The gVisor Tradeoff
-Vahini allows toggling the use of [gVisor](https://gvisor.dev/) (`runsc`) for sandboxing untrusted code. However, in an HFT benchmarking context, this introduces a substantial performance penalty.
-
-gVisor works by implementing a **userspace kernel** that intercepts and translates every system call. While this provides excellent security isolation (preventing container breakouts), it creates massive overhead for network-heavy, socket-bound applications like a matching engine.
-
-**Benchmarking Results (Standard Docker vs gVisor):**
-In a 10-second high-concurrency attack on an EC2 cluster using the exact same load profile, we observed:
-
-| Metric | With gVisor (`runsc`) | Standard Docker (`runc`) | Impact of gVisor |
-| :--- | :--- | :--- | :--- |
-| **Throughput (TPS)** | 896 requests/sec | 1,465 requests/sec | **~39% Drop** in throughput |
-| **Average Latency** | 860 ms | 525 ms | **335 ms slower** |
-| **p99 Latency** | 1,010 ms | 625 ms | **385 ms slower** at the tail |
-
-*Impact:* gVisor causes a **~39% drop in throughput** and adds **~385ms of latency** at the tail due to context switching and userspace networking overhead. 
-
-For strict HFT latency measurement, standard Docker with tightened native security (Seccomp profiles blocking unused syscalls, `--cap-drop=ALL`, user namespaces) or hardware-isolated Firecracker microVMs are recommended over gVisor to prevent the sandbox itself from polluting the latency metrics.

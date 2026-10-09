@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +13,7 @@ from sandbox import SandboxManager
 import httpx
 import time
 from dotenv import load_dotenv
-
+from ecs_helpers import spawn_workers, wait_for_tasks_and_get_ips, cleanup_workers
 load_dotenv()
 
 CORS_ORIGINS = os.getenv(
@@ -200,7 +200,7 @@ app.add_middleware(
 )
 sandbox=SandboxManager()
 
-websocket_clients=set()
+
 
 SUBMISSION_DIR = "/tmp/iicpc_submissions"
 os.makedirs(SUBMISSION_DIR, exist_ok=True)
@@ -238,86 +238,99 @@ async def background_deploy(submission_id, zip_path, metadata):
             await db_update_submission_status(submission_id, "starting_benchmark", endpoint=benchmark_endpoint)
             await wait_for_health(client, benchmark_endpoint)
 
-            # 1. Prepare Concurrency and Synchronized Start Time
+            # 1. Spawn ECS Workers dynamically
             target_concurrency = 800
-            active_workers = [w.strip() for w in LOAD_GENERATOR_URLS if w.strip()]
-            worker_concurrency = max(1, target_concurrency // len(active_workers))
-            start_time = int(time.time()) + 3  # Start exactly 3 seconds from now
-
-            # Replace localhost with Orchestrator's IP so remote workers know where to attack
-            remote_benchmark_endpoint = benchmark_endpoint.replace("localhost", HOST_IP).replace("127.0.0.1", HOST_IP)
-
-            go_payload={
-                "submission_id": submission_id,
-                "endpoint": remote_benchmark_endpoint,
-                "concurrency": worker_concurrency,
-                "duration_seconds": 10,
-                "start_time": start_time
-            }
-            sandbox.containers[submission_id]["status"]="benchmarking"
-            await db_update_submission_status(submission_id, "benchmarking", endpoint=remote_benchmark_endpoint)
+            num_workers = 3
+            worker_concurrency = max(1, target_concurrency // num_workers)
             
-            # 2. Scatter: Send HTTP commands to all Go workers concurrently
-            tasks = []
-            for worker_url in active_workers:
-                tasks.append(client.post(
-                    f"{worker_url}/benchmark",
-                    json=go_payload,
-                    timeout=go_payload["duration_seconds"]+20
-                ))
-            
-            # Wait for all workers to finish their 10-second storm
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
-            successful_responses = [r for r in responses if isinstance(r, httpx.Response) and r.status_code == 200]
+            task_arns = []
+            try:
+                task_arns = await asyncio.to_thread(spawn_workers, num_workers)
+                sandbox.containers[submission_id]["status"] = "spawning_workers"
+                await db_update_submission_status(submission_id, "spawning_workers", endpoint=benchmark_endpoint)
+                
+                worker_ips = await wait_for_tasks_and_get_ips(task_arns)
+                if len(worker_ips) != num_workers:
+                    raise Exception("Failed to get all worker IPs")
+                    
+                active_workers = [f"http://{ip}:8001" for ip in worker_ips]
+                
+                # Fargate is up. Let's wait a few seconds to ensure Go servers are bound to 8001
+                await asyncio.sleep(3)
 
-            # 3. Gather: Ensure all workers responded successfully before calculating metrics
-            if len(successful_responses) == len(active_workers) and len(active_workers) > 0:
-                print(f"[{submission_id}] Successfully gathered metrics from all {len(active_workers)} Go Load Generators.")
-                
-                total_requests = sum(r.json().get("total_requests", 0) for r in successful_responses)
-                success = sum(r.json().get("success", 0) for r in successful_responses)
-                failures = sum(r.json().get("failures", 0) for r in successful_responses)
-                
-                # Aggregate basic metrics
-                result = {
-                    "total_requests": total_requests,
-                    "success": success,
-                    "failures": failures,
-                    "tps": success / (0.75*go_payload["duration_seconds"]) if go_payload["duration_seconds"] > 0 else 0,
-                    "error_rate": (failures / total_requests * 100) if total_requests > 0 else 100,
-                    "avg_latency_ms": max((r.json().get("avg_latency_ms", 0) for r in successful_responses), default=0),
-                    "p50_latency_ms": max((r.json().get("p50_latency_ms", 0) for r in successful_responses), default=0),
-                    "p90_latency_ms": max((r.json().get("p90_latency_ms", 0) for r in successful_responses), default=0),
-                    "p99_latency_ms": max((r.json().get("p99_latency_ms", 0) for r in successful_responses), default=0),
+                start_time = int(time.time()) + 3  # Start exactly 3 seconds from now
+
+                # Replace localhost with Orchestrator's IP so remote workers know where to attack
+                remote_benchmark_endpoint = benchmark_endpoint.replace("localhost", HOST_IP).replace("127.0.0.1", HOST_IP)
+
+                go_payload={
+                    "submission_id": submission_id,
+                    "endpoint": remote_benchmark_endpoint,
+                    "concurrency": worker_concurrency,
+                    "duration_seconds": 10,
+                    "start_time": start_time
                 }
+                sandbox.containers[submission_id]["status"]="benchmarking"
+                await db_update_submission_status(submission_id, "benchmarking", endpoint=remote_benchmark_endpoint)
                 
-                # Safely merge status code dictionaries
-                combined_status_codes = {}
-                for r in successful_responses:
-                    for code, count in r.json().get("status_codes", {}).items():
-                        combined_status_codes[code] = combined_status_codes.get(code, 0) + count
-                result["status_codes"] = combined_status_codes
+                # 2. Scatter: Send HTTP commands to all Go workers concurrently
+                tasks = []
+                for worker_url in active_workers:
+                    tasks.append(client.post(
+                        f"{worker_url}/benchmark",
+                        json=go_payload,
+                        timeout=go_payload["duration_seconds"]+20
+                    ))
                 
-                result["submission_id"] = submission_id
-                result.update(metadata)
-                result["correctness_score"] = correctness_score["score"]
-                result["correctness_checks"]= correctness_score["checks"]
-                result["score"] = calculate_score(result, correctness_score["score"])
-                await db_insert_benchmark_result(submission_id, result)
-                await db_update_submission_status(submission_id, "completed")
-                sandbox.containers[submission_id]["status"]="completed"
-                sandbox.containers[submission_id]["result"]=result
-                try:
-                    await broadcast_leaderboard()
-                except Exception as broadcast_error:
-                    print(f"[{submission_id}] Leaderboard broadcast failed: {broadcast_error}")
-            else:
-                print(f"[{submission_id}] One or more Go load generators failed. Responses: {responses}")
-                sandbox.containers[submission_id]["status"] = "failed_handoff"
-                await db_update_submission_status(submission_id, "failed_handoff", error="Worker failure or timeout")
+                # Wait for all workers to finish their 10-second storm
+                responses = await asyncio.gather(*tasks, return_exceptions=True)
+                successful_responses = [r for r in responses if isinstance(r, httpx.Response) and r.status_code == 200]
 
+                # 3. Gather: Ensure all workers responded successfully before calculating metrics
+                if len(successful_responses) == len(active_workers) and len(active_workers) > 0:
+                    print(f"[{submission_id}] Successfully gathered metrics from all {len(active_workers)} Go Load Generators.")
+                    
+                    total_requests = sum(r.json().get("total_requests", 0) for r in successful_responses)
+                    success = sum(r.json().get("success", 0) for r in successful_responses)
+                    failures = sum(r.json().get("failures", 0) for r in successful_responses)
+                    
+                    # Aggregate basic metrics
+                    result = {
+                        "total_requests": total_requests,
+                        "success": success,
+                        "failures": failures,
+                        "tps": success / (0.75*go_payload["duration_seconds"]) if go_payload["duration_seconds"] > 0 else 0,
+                        "error_rate": (failures / total_requests * 100) if total_requests > 0 else 100,
+                        "avg_latency_ms": max((r.json().get("avg_latency_ms", 0) for r in successful_responses), default=0),
+                        "p50_latency_ms": max((r.json().get("p50_latency_ms", 0) for r in successful_responses), default=0),
+                        "p90_latency_ms": max((r.json().get("p90_latency_ms", 0) for r in successful_responses), default=0),
+                        "p99_latency_ms": max((r.json().get("p99_latency_ms", 0) for r in successful_responses), default=0),
+                    }
+                    
+                    # Safely merge status code dictionaries
+                    combined_status_codes = {}
+                    for r in successful_responses:
+                        for code, count in r.json().get("status_codes", {}).items():
+                            combined_status_codes[code] = combined_status_codes.get(code, 0) + count
+                    result["status_codes"] = combined_status_codes
+                    
+                    result["submission_id"] = submission_id
+                    result.update(metadata)
+                    result["correctness_score"] = correctness_score["score"]
+                    result["correctness_checks"]= correctness_score["checks"]
+                    result["score"] = calculate_score(result, correctness_score["score"])
+                    await db_insert_benchmark_result(submission_id, result)
+                    await db_update_submission_status(submission_id, "completed")
+                    sandbox.containers[submission_id]["status"]="completed"
+                    sandbox.containers[submission_id]["result"]=result
 
-
+                else:
+                    print(f"[{submission_id}] One or more Go load generators failed. Responses: {responses}")
+                    sandbox.containers[submission_id]["status"] = "failed_handoff"
+                    await db_update_submission_status(submission_id, "failed_handoff", error="Worker failure or timeout")
+            finally:
+                if task_arns:
+                    await asyncio.to_thread(cleanup_workers, task_arns)
     except Exception as e:
         print(f"[{submission_id}] Deployment failed: {str(e)}")
         await db_update_submission_status(submission_id,"failed", error=str(e))
@@ -403,32 +416,7 @@ async def get_leaderboard():
     return await db_get_leaderboard()
 
 
-# sends latest leaderboard to every connected frontend
-async def broadcast_leaderboard():
-    data= await get_leaderboard()
-    dead_clients=[]
 
-    for ws in websocket_clients:
-        try:
-            await ws.send_json(data)
-        except Exception:
-            dead_clients.append(ws)
-    for ws in dead_clients:
-        websocket_clients.discard(ws)
-
-
-
-# live connection for automatic leaderboard updates
-@app.websocket("/ws/leaderboard")
-async def leaderboard_ws(websocket : WebSocket):
-    await websocket.accept()
-    websocket_clients.add(websocket)
-    try:
-        await websocket.send_json(await get_leaderboard())
-        while True:
-            await asyncio.sleep(30)
-    except WebSocketDisconnect:
-        websocket_clients.discard(websocket)
 
 async def run_correctness_check(client, endpoint):
     try:
