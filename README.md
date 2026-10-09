@@ -27,25 +27,25 @@ flowchart TB
     classDef aws fill:#ff9900,stroke:#232f3e,stroke-width:2px,color:#000
 
     subgraph Internet ["Public Internet"]
-        UserBrowser["ðŸŒ User Browser\n(React Frontend)"]:::frontend
+        UserBrowser["🌐 User Browser\n(React Frontend)"]:::frontend
     end
 
     subgraph AWS ["AWS Virtual Private Cloud (VPC)"]
         subgraph OrchestratorNode ["Central Orchestrator (EC2: 106.222.224.67)"]
-            FastAPI["âš¡ FastAPI Backend\n(Port 8000)"]:::python
-            Postgres[("ðŸ˜ PostgreSQL DB\n(Leaderboard/Scores)")]:::db
+            FastAPI["⚡ FastAPI Backend\n(Port 8000)"]:::python
+            Postgres[("🐘 PostgreSQL DB\n(Leaderboard/Scores)")]:::db
             
             subgraph DockerEnv ["Docker Runtime"]
-                gVisor["ðŸ›¡ï¸ gVisor Sandbox (runsc)\n(Port 8080)"]:::docker
+                gVisor["🛡️ gVisor Sandbox (runsc)\n(Port 8080)"]:::docker
                 ContestantCode["Contestant Trading Engine\n(C++, Go, Rust, Java, etc.)"]
                 gVisor --- ContestantCode
             end
         end
 
         subgraph WorkerFleet ["Load Generator Fleet (EC2 Private Subnet)"]
-            GoWorker1["ðŸ¹ Go Worker Node 1\n(172.31.8.102:8001)"]:::go
-            GoWorker2["ðŸ¹ Go Worker Node 2\n(172.31.6.96:8001)"]:::go
-            GoWorker3["ðŸ¹ Go Worker Node 3\n(172.31.13.78:8001)"]:::go
+            GoWorker1["🐹 Go Worker Node 1\n(172.31.8.102:8001)"]:::go
+            GoWorker2["🐹 Go Worker Node 2\n(172.31.6.96:8001)"]:::go
+            GoWorker3["🐹 Go Worker Node 3\n(172.31.13.78:8001)"]:::go
         end
     end
 
@@ -129,10 +129,10 @@ Infrastructure:    AWS EC2
 
 ```text
 .
-â”œâ”€â”€ frontend/              # React/Vite Vahini dashboard
-â”œâ”€â”€ load_generator/        # Go load generation service
-â”œâ”€â”€ submission_engine/     # FastAPI submission/sandbox/orchestration service
-â””â”€â”€ docs/images/           # README screenshots
+├── frontend/              # React/Vite Vahini dashboard
+├── load_generator/        # Go load generation service
+├── submission_engine/     # FastAPI submission/sandbox/orchestration service
+└── docs/images/           # README screenshots
 ```
 
 ## Local Ports
@@ -410,8 +410,12 @@ gVisor works by implementing a **userspace kernel** that intercepts and translat
 
 **Benchmarking Results (Standard Docker vs gVisor):**
 In a 10-second high-concurrency attack on an EC2 cluster using the exact same load profile, we observed:
-* **Standard Docker (`runc`)**: ~1,465 TPS | ~625ms p99 latency
-* **gVisor (`runsc`)**: ~896 TPS | ~1,010ms p99 latency
+
+| Metric | With gVisor (`runsc`) | Standard Docker (`runc`) | Impact of gVisor |
+| :--- | :--- | :--- | :--- |
+| **Throughput (TPS)** | 896 requests/sec | 1,465 requests/sec | **~39% Drop** in throughput |
+| **Average Latency** | 860 ms | 525 ms | **335 ms slower** |
+| **p99 Latency** | 1,010 ms | 625 ms | **385 ms slower** at the tail |
 
 *Impact:* gVisor causes a **~39% drop in throughput** and adds **~385ms of latency** at the tail due to context switching and userspace networking overhead. 
 
